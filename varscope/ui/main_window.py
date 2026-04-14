@@ -62,6 +62,7 @@ DISPLAY_MAX_POINTS = 12_000
 MAIN_FOLLOW_WINDOW_SECONDS = 5.0
 PLOT_REFRESH_INTERVAL_NS = 33_333_333
 OVERVIEW_REFRESH_INTERVAL_NS = 1_000_000_000
+USER_PLOT_INTERACTION_WINDOW_NS = 1_000_000_000
 VALUE_REFRESH_INTERVAL_NS = 100_000_000
 MAX_FRAMES_PER_POLL = 256
 GUI_POLL_INTERVAL_MS = 16
@@ -589,6 +590,7 @@ class MainWindow(QMainWindow):
         self._refreshing_plots = False
         self._follow_latest = True
         self._manual_y_range = False
+        self._last_plot_user_interaction_ns = 0
         self._base_timestamp_ns = 0
         self._cursor_proxy: pg.SignalProxy | None = None
         self._capture_timestamps_ns: deque[int] = deque(maxlen=4096)
@@ -873,6 +875,7 @@ class MainWindow(QMainWindow):
         self.main_plot.setLabel("bottom", "时间 (s)")
         self.main_view = self.main_plot.getViewBox()
         self.main_view.setMouseMode(pg.ViewBox.RectMode)
+        self.main_view.enableAutoRange(axis=pg.ViewBox.XAxis, enable=False)
         self.main_view.enableAutoRange(axis=pg.ViewBox.YAxis, enable=True)
         self.main_view.setAutoVisible(y=True)
 
@@ -882,7 +885,10 @@ class MainWindow(QMainWindow):
         self.overview_plot.setLabel("bottom", "时间 (s)")
         self.overview_view = self.overview_plot.getViewBox()
         self.overview_view.setMouseEnabled(x=False, y=False)
+        self.overview_view.enableAutoRange(axis=pg.ViewBox.XAxis, enable=False)
         self.overview_view.enableAutoRange(axis=pg.ViewBox.YAxis, enable=True)
+        self.main_plot.viewport().installEventFilter(self)
+        self.overview_plot.viewport().installEventFilter(self)
 
         self.region = pg.LinearRegionItem(
             values=(0.0, 1.0),
@@ -1249,8 +1255,8 @@ class MainWindow(QMainWindow):
             return
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(True)
-        self._reset_series()
         self._set_follow_latest(True)
+        self._reset_series()
         self.status_label.setText(f"采集已开始：{path.name}")
 
     def stop_capture(self) -> None:
@@ -1314,10 +1320,31 @@ class MainWindow(QMainWindow):
             return
         self.status_label.setText(f"CSV 已导出到 {Path(path).name}")
 
+    def eventFilter(self, watched, event) -> bool:
+        if watched in (self.main_plot.viewport(), self.overview_plot.viewport()):
+            if self._is_plot_user_interaction(event):
+                self._last_plot_user_interaction_ns = time.monotonic_ns()
+        return super().eventFilter(watched, event)
+
+    @staticmethod
+    def _is_plot_user_interaction(event) -> bool:
+        event_type = event.type()
+        if event_type in (QEvent.Wheel, QEvent.MouseButtonPress, QEvent.MouseButtonDblClick):
+            return True
+        if event_type == QEvent.MouseMove and hasattr(event, "buttons"):
+            return event.buttons() != Qt.NoButton
+        return False
+
+    def _plot_range_change_is_user_driven(self) -> bool:
+        if self._last_plot_user_interaction_ns == 0:
+            return False
+        return time.monotonic_ns() - self._last_plot_user_interaction_ns <= USER_PLOT_INTERACTION_WINDOW_NS
+
     def _set_follow_latest(self, enabled: bool) -> None:
         self._follow_latest = enabled
         if enabled:
             self._manual_y_range = False
+            self._last_plot_user_interaction_ns = 0
 
     def _jump_to_latest(self) -> None:
         self._set_follow_latest(True)
@@ -1515,10 +1542,10 @@ class MainWindow(QMainWindow):
             pen = pg.mkPen(watch.definition.color, width=1.8)
             main_item = self.main_plot.plot([], [], pen=pen)
             overview_item = self.overview_plot.plot([], [], pen=pen)
-            main_item.setClipToView(True)
-            overview_item.setClipToView(True)
-            main_item.setDownsampling(auto=True, method="peak")
-            overview_item.setDownsampling(auto=True, method="peak")
+            main_item.setClipToView(False)
+            overview_item.setClipToView(False)
+            main_item.setDownsampling(auto=False)
+            overview_item.setDownsampling(auto=False)
             self._plot_items.append((main_item, overview_item))
 
         self.watch_table.clearSelection()
@@ -1572,7 +1599,12 @@ class MainWindow(QMainWindow):
                 main_end = len(self._watch_times)
 
             now_ns = time.monotonic_ns()
-            refresh_overview = force or now_ns - self._last_overview_refresh_ns >= OVERVIEW_REFRESH_INTERVAL_NS
+            refresh_overview = (
+                force
+                or self._follow_latest
+                or now_ns - self._last_overview_refresh_ns >= OVERVIEW_REFRESH_INTERVAL_NS
+            )
+            self._update_overview_range()
             visible_x = np.asarray(self._watch_times[main_start:main_end], dtype=float)
             overview_x = np.asarray(self._watch_times, dtype=float) if refresh_overview else None
             enabled_plot_count = self._enabled_plot_count()
@@ -1601,7 +1633,8 @@ class MainWindow(QMainWindow):
                 self.main_view.enableAutoRange(axis=pg.ViewBox.YAxis, enable=True)
                 self.main_view.setAutoVisible(y=True)
             self.overview_view.enableAutoRange(axis=pg.ViewBox.YAxis, enable=True)
-            self._update_plot_range()
+            if self._follow_latest:
+                self._apply_main_span((main_left, main_right), padding=0)
             self._last_plot_refresh_ns = now_ns
             self._plot_refresh_timestamps_ns.append(now_ns)
             self._update_plot_rate_label()
@@ -1630,17 +1663,6 @@ class MainWindow(QMainWindow):
             return first, latest
         return left, right
 
-    def _update_plot_range(self) -> None:
-        overview_span = self._update_overview_range()
-        if overview_span is None:
-            return
-        if not self._follow_latest:
-            return
-
-        span = self._current_main_plot_span()
-        if span is None:
-            return
-        self._apply_main_span(span, padding=0)
 
     def _latest_follow_span(self) -> tuple[float, float] | None:
         return _latest_window_span(self._watch_times, MAIN_FOLLOW_WINDOW_SECONDS)
@@ -1649,10 +1671,17 @@ class MainWindow(QMainWindow):
         start, end = span
         self._syncing_region = True
         try:
-            self.main_plot.setXRange(start, end, padding=padding)
-            self.region.setRegion((start, end))
+            self._set_main_x_range(start, end, padding=padding)
+            self._set_region_range(start, end)
         finally:
             self._syncing_region = False
+
+    def _set_main_x_range(self, start: float, end: float, *, padding: float = 0.0) -> None:
+        self.main_view.enableAutoRange(axis=pg.ViewBox.XAxis, enable=False)
+        self.main_view.setRange(xRange=(start, end), padding=padding, disableAutoRange=True)
+
+    def _set_region_range(self, start: float, end: float) -> None:
+        self.region.setRegion((start, end))
 
     def _update_overview_range(self) -> tuple[float, float] | None:
         if not self._watch_times:
@@ -1663,7 +1692,8 @@ class MainWindow(QMainWindow):
             end = start + 1e-3
         self._syncing_region = True
         try:
-            self.overview_plot.setXRange(start, end, padding=0)
+            self.overview_view.enableAutoRange(axis=pg.ViewBox.XAxis, enable=False)
+            self.overview_view.setRange(xRange=(start, end), padding=0, disableAutoRange=True)
             self.region.setBounds((start, end))
         finally:
             self._syncing_region = False
@@ -1674,9 +1704,10 @@ class MainWindow(QMainWindow):
         self._syncing_region = True
         try:
             self.region.setBounds((0.0, 1.0))
-            self.region.setRegion((0.0, 1.0))
-            self.main_plot.setXRange(0.0, 1.0, padding=0)
-            self.overview_plot.setXRange(0.0, 1.0, padding=0)
+            self._set_region_range(0.0, 1.0)
+            self._set_main_x_range(0.0, 1.0, padding=0)
+            self.overview_view.enableAutoRange(axis=pg.ViewBox.XAxis, enable=False)
+            self.overview_view.setRange(xRange=(0.0, 1.0), padding=0, disableAutoRange=True)
         finally:
             self._syncing_region = False
         self.main_view.enableAutoRange(axis=pg.ViewBox.YAxis, enable=True)
@@ -1708,39 +1739,45 @@ class MainWindow(QMainWindow):
         self._syncing_region = True
         try:
             self.main_view.setRange(xRange=x_range, yRange=y_range, padding=0)
-            self.region.setRegion(x_range)
+            self._set_region_range(x_range[0], x_range[1])
         finally:
             self._syncing_region = False
 
     def _on_main_view_range_changed(self, _, ranges) -> None:
         if self._syncing_region or self._refreshing_plots or not self._watch_times:
             return
+        if not self._plot_range_change_is_user_driven():
+            return
         if _normalize_x_range(ranges) is not None:
             self._manual_y_range = True
             self.main_view.enableAutoRange(axis=pg.ViewBox.YAxis, enable=False)
 
     def _sync_main_to_region(self) -> None:
+        left, right = self.region.getRegion()
         if self._syncing_region or not self._watch_times:
             return
+        if self._follow_latest and not self._plot_range_change_is_user_driven():
+            return
         self._set_follow_latest(False)
-        left, right = self.region.getRegion()
         self._syncing_region = True
         try:
-            self.main_plot.setXRange(left, right, padding=0)
+            self._set_main_x_range(left, right, padding=0)
         finally:
             self._syncing_region = False
         self._schedule_visible_plot_refresh()
 
     def _sync_region_to_main(self, _, view_range) -> None:
-        if self._syncing_region or not self._watch_times:
-            return
         x_range = _normalize_x_range(view_range)
         if x_range is None:
+            return
+        if self._syncing_region or not self._watch_times:
+            return
+        if self._follow_latest and not self._plot_range_change_is_user_driven():
             return
         self._set_follow_latest(False)
         self._syncing_region = True
         try:
-            self.region.setRegion((x_range[0], x_range[1]))
+            self._set_region_range(x_range[0], x_range[1])
         finally:
             self._syncing_region = False
         self._schedule_visible_plot_refresh()
@@ -1792,8 +1829,8 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             _show_warning(self, "变量更新失败", f"变量列表已变化，但重新开始采集失败：\n{exc}")
             return
-        self._reset_series()
         self._set_follow_latest(True)
+        self._reset_series()
         self.status_label.setText(f"变量已更新，重新开始采集：{path.name}")
 
 
