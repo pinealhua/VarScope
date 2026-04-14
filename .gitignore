@@ -1,0 +1,57 @@
+# Python cache and test artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Packaging and build outputs
+build/
+dist/
+*.egg-info/
+VarScope-build/
+VarScope-portable/
+VarScope-portable-*.zip
+release/
+
+# PyInstaller local output
+*.log
+
+# Local portable packaging sources
+VarScope.spec
+Wheat.jpg
+scripts/build_portable.ps1
+scripts/generate_icon.py
+
+# Runtime/user data
+runtime/*
+!runtime/README.md
+!runtime/default.varscope.json
+
+# Local IDE/editor state
+.idea/
+.vscode/
+
+# OS files
+Thumbs.db
+Desktop.ini
+*.lnk
+
+# Local embedded firmware/build artifacts
+*.elf
+*.axf
+*.hex
+*.bin
+*.map
+*.lst
+*.o
+*.d

@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "varscope"
+version = "0.1.0"
+description = "ELF + OpenOCD based variable watch desktop tool"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "PySide6>=6.7",
+  "pyqtgraph>=0.13",
+  "pyelftools>=0.31",
+  "numpy>=2.0",
+]
+
+[project.optional-dependencies]
+build = [
+  "pyinstaller>=6.0",
+]
+[project.scripts]
+varscope = "varscope.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["varscope"]
