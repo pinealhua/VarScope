@@ -189,3 +189,7 @@ python launch_varscope.py
 这个工具还会继续迭代。如果使用过程中遇到问题，或者有功能建议，可以发到我的邮箱：`2410048988@qq.com`。
 
 后续我也会在 GitHub 上持续整理 issue、修复问题和增加新功能。
+
+## 许可证
+
+本项目使用 MIT License 开源，详见 [LICENSE](LICENSE)。
