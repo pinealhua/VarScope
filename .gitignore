@@ -31,6 +31,7 @@ VarScope.spec
 Wheat.jpg
 scripts/build_portable.ps1
 scripts/generate_icon.py
+scripts/embed_readme_images.py
 
 # Runtime/user data
 runtime/*
