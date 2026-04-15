@@ -14,7 +14,7 @@
 
 ## 下载
 
-用户可以在右侧 Releases 中下载最新版 `VarScope-portable-dev.zip`。
+用户可以在右侧 Releases 中下载最新版 `VarScope-portable-版本号.zip`。
 
 ![alt text](image.png)
 
