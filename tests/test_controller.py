@@ -51,6 +51,14 @@ class _Store:
     pass
 
 
+class _CsvStore:
+    def __init__(self) -> None:
+        self.exported_watches: list[ResolvedWatch] | None = None
+
+    def export_csv(self, _destination: Path, watches: list[ResolvedWatch]) -> None:
+        self.exported_watches = watches
+
+
 class _Recorder:
     def __init__(self, store: _Store) -> None:
         self.store = store
@@ -192,15 +200,30 @@ class SessionControllerCompletionTests(unittest.TestCase):
         self.assertEqual(len(worker.watches), 2)
         self.assertEqual(sum(len(region.slices) for region in worker.regions), 2)
 
-    def test_stop_capture_does_not_drain_recorder_backlog(self) -> None:
+    def test_stop_capture_drains_recorder_backlog(self) -> None:
         controller = SessionController(Path("."))
         recorder = _Recorder(_Store())
         controller.recorder = recorder  # type: ignore[assignment]
 
         controller.stop_capture()
 
-        self.assertFalse(recorder.stop_drain)
+        self.assertTrue(recorder.stop_drain)
         self.assertIsNone(controller.recorder)
+
+    def test_export_csv_uses_capture_watch_snapshot(self) -> None:
+        u16 = TypeInfo(kind="base", name="uint16_t", byte_size=2)
+        captured = [_resolved_watch("power_w", 0x20000000, u16)]
+        current = [_resolved_watch("motor_rpm", 0x20000002, u16)]
+        store = _CsvStore()
+        controller = SessionController(Path("."))
+        controller.current_session_path = Path("capture.sqlite")
+        controller.current_session_watches = captured
+        controller.resolved_watches = current
+        controller.session_store = store  # type: ignore[assignment]
+
+        controller.export_csv(Path("out.csv"))
+
+        self.assertIs(store.exported_watches, captured)
 
     def test_start_capture_freezes_watch_list_for_store_and_sampler(self) -> None:
         u16 = TypeInfo(kind="base", name="uint16_t", byte_size=2)
@@ -239,6 +262,8 @@ class SessionControllerCompletionTests(unittest.TestCase):
         self.assertIsNot(captured_sampler_watches, watches)
         self.assertEqual(len(captured_store_watches or []), 2)
         self.assertEqual(len(captured_sampler_watches or []), 2)
+        self.assertIsNot((captured_store_watches or [])[0], watches[0])
+        self.assertIsNot((captured_store_watches or [])[0].definition, watches[0].definition)
 
 
 if __name__ == "__main__":

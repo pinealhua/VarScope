@@ -42,8 +42,10 @@ class ResolvedWatch:
 @dataclass(slots=True)
 class SampleFrame:
     timestamp_ns: int
-    raw_values: list[bytes]
+    raw_values: list[bytes] | None
     decoded_values: list[Any]
+    region_payloads: tuple[bytes, ...] | None = None
+    read_regions: tuple[Any, ...] | None = None
 
 
 @dataclass(slots=True)

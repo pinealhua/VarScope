@@ -51,6 +51,7 @@ from varscope.core.decoder import format_value
 from varscope.models import ProbePreset, SampleFrame, WatchDefinition
 from varscope.paths import resource_path
 from varscope.presets import delete_preset_archive, save_preset_archive, saved_presets
+from varscope.ui.plot_history import PlotHistoryBuffer
 
 
 PRESET_ROLE = Qt.UserRole + 1
@@ -582,8 +583,7 @@ class MainWindow(QMainWindow):
         self.controller = SessionController(self.app_root)
 
         self._plot_items: list[tuple[pg.PlotDataItem, pg.PlotDataItem]] = []
-        self._watch_values: list[list[float]] = []
-        self._watch_times: list[float] = []
+        self._plot_history = PlotHistoryBuffer()
         self._latest_value_strings: list[str] = []
         self._updating_table = False
         self._syncing_region = False
@@ -593,7 +593,6 @@ class MainWindow(QMainWindow):
         self._last_plot_user_interaction_ns = 0
         self._base_timestamp_ns = 0
         self._cursor_proxy: pg.SignalProxy | None = None
-        self._capture_timestamps_ns: deque[int] = deque(maxlen=4096)
         self._plot_refresh_timestamps_ns: deque[int] = deque(maxlen=512)
         self._last_plot_refresh_ns = 0
         self._last_overview_refresh_ns = 0
@@ -1350,7 +1349,7 @@ class MainWindow(QMainWindow):
         self._set_follow_latest(True)
         self.main_view.enableAutoRange(axis=pg.ViewBox.YAxis, enable=True)
         self.main_view.setAutoVisible(y=True)
-        if not self._watch_times:
+        if not self._plot_history:
             return
         self._refresh_plots(force=True)
         span = self._latest_follow_span()
@@ -1369,7 +1368,7 @@ class MainWindow(QMainWindow):
         return self.main_plot.mapToScene(widget_pos)
 
     def _refresh_cursor_readout(self, pos=None) -> None:
-        if not self._point_readout_enabled() or not self._watch_times:
+        if not self._point_readout_enabled() or not self._plot_history:
             self._refresh_point_column(None)
             return
         if pos is None:
@@ -1385,13 +1384,14 @@ class MainWindow(QMainWindow):
         self.crosshair_vline.setPos(cursor_x)
         self.crosshair_hline.setPos(cursor_y)
 
-        index = _nearest_index(self._watch_times, cursor_x)
+        times = self._plot_history.times_view()
+        index = _nearest_index(times, cursor_x)
         if index is None:
             self.point_meta_label.setText("点值：--")
             self._refresh_point_column(None)
             return
 
-        time_value = self._watch_times[index]
+        time_value = self._plot_history.time_at(index)
         self.point_meta_label.setText(f"点值：t={time_value:.6f}s, y={cursor_y:.6g}")
         self._refresh_point_column(index)
 
@@ -1420,38 +1420,37 @@ class MainWindow(QMainWindow):
             self._refresh_plots()
 
     def _append_frames(self, frames: list[SampleFrame], *, frame_timestamps: list[int] | None = None) -> None:
-        if frame_timestamps:
-            self._capture_timestamps_ns.extend(frame_timestamps)
         if not frames:
             return
-        if not self._watch_values:
+        if self._plot_history.watch_count != len(self.controller.resolved_watches):
             self._reset_series()
         if self._base_timestamp_ns == 0:
             self._base_timestamp_ns = frames[0].timestamp_ns
 
+        appended_timestamps: list[float] = []
+        appended_values = [[] for _ in self.controller.resolved_watches]
         last_decoded_values = None
         last_frame_index = len(frames) - 1
         for frame_index, frame in enumerate(frames):
             timestamp_s = (frame.timestamp_ns - self._base_timestamp_ns) / 1_000_000_000.0
-            if frame_timestamps is None:
-                self._capture_timestamps_ns.append(frame.timestamp_ns)
             last_decoded_values = frame.decoded_values
 
             if not self._should_keep_display_frame(timestamp_s, frame_index == last_frame_index):
                 continue
 
-            self._watch_times.append(timestamp_s)
+            appended_timestamps.append(timestamp_s)
             self._last_display_timestamp_s = timestamp_s
             for index, value in enumerate(frame.decoded_values):
-                if index >= len(self._watch_values):
+                if index >= len(appended_values):
                     continue
                 numeric = value if isinstance(value, (bool, int, float)) else float("nan")
                 if isinstance(numeric, bool):
                     numeric = 1.0 if numeric else 0.0
-                self._watch_values[index].append(float(numeric))
+                appended_values[index].append(float(numeric))
 
         if last_decoded_values is not None:
             self._latest_value_strings = [format_value(value) for value in last_decoded_values]
+        self._plot_history.append_batch(appended_timestamps, appended_values)
         self._trim_display_cache()
         self._update_capture_rate_label()
 
@@ -1464,20 +1463,7 @@ class MainWindow(QMainWindow):
         return is_last_frame and timestamp_s > self._last_display_timestamp_s
 
     def _trim_display_cache(self) -> None:
-        if not self._watch_times:
-            return
-
-        cutoff = self._watch_times[-1] - DISPLAY_HISTORY_SECONDS
-        drop_count = bisect_left(self._watch_times, cutoff)
-        remaining = len(self._watch_times) - drop_count
-        if remaining > DISPLAY_MAX_POINTS:
-            drop_count += remaining - DISPLAY_MAX_POINTS
-        if drop_count <= 0:
-            return
-
-        del self._watch_times[:drop_count]
-        for values in self._watch_values:
-            del values[:drop_count]
+        self._plot_history.trim(DISPLAY_HISTORY_SECONDS, DISPLAY_MAX_POINTS)
 
     def _rebuild_watch_table(self) -> None:
         self._updating_table = True
@@ -1522,12 +1508,12 @@ class MainWindow(QMainWindow):
             if (
                 cursor_index is None
                 or not watch.definition.plot_enabled
-                or row >= len(self._watch_values)
-                or cursor_index >= len(self._watch_values[row])
+                or row >= self._plot_history.watch_count
+                or cursor_index >= len(self._plot_history)
             ):
                 item.setText("-")
                 continue
-            value = self._watch_values[row][cursor_index]
+            value = self._plot_history.value_at(row, cursor_index)
             text = "-" if np.isnan(value) else f"{value:.6g}"
             if item.text() != text:
                 item.setText(text)
@@ -1542,8 +1528,8 @@ class MainWindow(QMainWindow):
             pen = pg.mkPen(watch.definition.color, width=1.8)
             main_item = self.main_plot.plot([], [], pen=pen)
             overview_item = self.overview_plot.plot([], [], pen=pen)
-            main_item.setClipToView(False)
-            overview_item.setClipToView(False)
+            main_item.setClipToView(True)
+            overview_item.setClipToView(True)
             main_item.setDownsampling(auto=False)
             overview_item.setDownsampling(auto=False)
             self._plot_items.append((main_item, overview_item))
@@ -1553,10 +1539,8 @@ class MainWindow(QMainWindow):
 
     def _reset_series(self) -> None:
         self._base_timestamp_ns = 0
-        self._watch_times = []
-        self._watch_values = [[] for _ in self.controller.resolved_watches]
+        self._plot_history.reset(len(self.controller.resolved_watches))
         self._latest_value_strings = ["-"] * len(self.controller.resolved_watches)
-        self._capture_timestamps_ns.clear()
         self._plot_refresh_timestamps_ns.clear()
         self._plot_refresh_pending = False
         self._last_plot_refresh_ns = 0
@@ -1576,7 +1560,7 @@ class MainWindow(QMainWindow):
         if not self._plot_items:
             self._reset_plot_view()
             return
-        if not self._watch_times:
+        if not self._plot_history:
             for main_item, overview_item in self._plot_items:
                 main_item.setData([], [])
                 overview_item.setData([], [])
@@ -1587,16 +1571,17 @@ class MainWindow(QMainWindow):
 
         self._refreshing_plots = True
         try:
+            times = self._plot_history.times_view()
             main_span = self._current_main_plot_span()
             if main_span is None:
-                main_left, main_right = self._watch_times[0], self._watch_times[-1]
+                main_left, main_right = float(times[0]), float(times[-1])
             else:
                 main_left, main_right = main_span
-            main_start = max(0, bisect_left(self._watch_times, main_left))
-            main_end = min(len(self._watch_times), bisect_right(self._watch_times, main_right))
+            main_start = max(0, bisect_left(times, main_left))
+            main_end = min(len(times), bisect_right(times, main_right))
             if main_end <= main_start:
-                main_start = max(0, len(self._watch_times) - 1)
-                main_end = len(self._watch_times)
+                main_start = max(0, len(times) - 1)
+                main_end = len(times)
 
             now_ns = time.monotonic_ns()
             refresh_overview = (
@@ -1605,28 +1590,27 @@ class MainWindow(QMainWindow):
                 or now_ns - self._last_overview_refresh_ns >= OVERVIEW_REFRESH_INTERVAL_NS
             )
             self._update_overview_range()
-            visible_x = np.asarray(self._watch_times[main_start:main_end], dtype=float)
-            overview_x = np.asarray(self._watch_times, dtype=float) if refresh_overview else None
+            visible_x = times[main_start:main_end]
+            overview_x = times if refresh_overview else None
             enabled_plot_count = self._enabled_plot_count()
             main_point_budget = _main_plot_point_budget(enabled_plot_count)
             overview_point_budget = _overview_plot_point_budget(enabled_plot_count)
 
             for index, watch in enumerate(self.controller.resolved_watches):
-                if index >= len(self._watch_values):
+                if index >= self._plot_history.watch_count:
                     continue
-                values = self._watch_values[index]
-                if not watch.definition.plot_enabled or not values:
+                values = self._plot_history.values_view(index)
+                if not watch.definition.plot_enabled or values.size == 0:
                     self._plot_items[index][0].setData([], [])
                     self._plot_items[index][1].setData([], [])
                     continue
 
-                visible_y = np.asarray(values[main_start:main_end], dtype=float)
+                visible_y = values[main_start:main_end]
                 main_x, main_y = _downsample(visible_x, visible_y, main_point_budget)
                 self._plot_items[index][0].setData(main_x, main_y)
 
                 if refresh_overview and overview_x is not None:
-                    overview_y = np.asarray(values, dtype=float)
-                    overview_plot_x, overview_plot_y = _downsample(overview_x, overview_y, overview_point_budget)
+                    overview_plot_x, overview_plot_y = _downsample(overview_x, values, overview_point_budget)
                     self._plot_items[index][1].setData(overview_plot_x, overview_plot_y)
 
             if not self._manual_y_range:
@@ -1646,10 +1630,11 @@ class MainWindow(QMainWindow):
             self._refreshing_plots = False
 
     def _current_main_plot_span(self) -> tuple[float, float] | None:
-        if not self._watch_times:
+        times = self._plot_history.times_view()
+        if times.size == 0:
             return None
-        first = self._watch_times[0]
-        latest = self._watch_times[-1]
+        first = float(times[0])
+        latest = float(times[-1])
         if self._follow_latest:
             return self._latest_follow_span()
 
@@ -1665,7 +1650,7 @@ class MainWindow(QMainWindow):
 
 
     def _latest_follow_span(self) -> tuple[float, float] | None:
-        return _latest_window_span(self._watch_times, MAIN_FOLLOW_WINDOW_SECONDS)
+        return _latest_window_span(self._plot_history.times_view(), MAIN_FOLLOW_WINDOW_SECONDS)
 
     def _apply_main_span(self, span: tuple[float, float], *, padding: float = 0.0) -> None:
         start, end = span
@@ -1684,10 +1669,11 @@ class MainWindow(QMainWindow):
         self.region.setRegion((start, end))
 
     def _update_overview_range(self) -> tuple[float, float] | None:
-        if not self._watch_times:
+        times = self._plot_history.times_view()
+        if times.size == 0:
             return None
-        start = self._watch_times[0]
-        end = self._watch_times[-1]
+        start = float(times[0])
+        end = float(times[-1])
         if end <= start:
             end = start + 1e-3
         self._syncing_region = True
@@ -1744,7 +1730,7 @@ class MainWindow(QMainWindow):
             self._syncing_region = False
 
     def _on_main_view_range_changed(self, _, ranges) -> None:
-        if self._syncing_region or self._refreshing_plots or not self._watch_times:
+        if self._syncing_region or self._refreshing_plots or not self._plot_history:
             return
         if not self._plot_range_change_is_user_driven():
             return
@@ -1754,7 +1740,7 @@ class MainWindow(QMainWindow):
 
     def _sync_main_to_region(self) -> None:
         left, right = self.region.getRegion()
-        if self._syncing_region or not self._watch_times:
+        if self._syncing_region or not self._plot_history:
             return
         if self._follow_latest and not self._plot_range_change_is_user_driven():
             return
@@ -1770,7 +1756,7 @@ class MainWindow(QMainWindow):
         x_range = _normalize_x_range(view_range)
         if x_range is None:
             return
-        if self._syncing_region or not self._watch_times:
+        if self._syncing_region or not self._plot_history:
             return
         if self._follow_latest and not self._plot_range_change_is_user_driven():
             return
@@ -1789,14 +1775,14 @@ class MainWindow(QMainWindow):
         return _plot_refresh_interval_ns(self._enabled_plot_count())
 
     def _schedule_visible_plot_refresh(self) -> None:
-        if not self._watch_times or not self._plot_items:
+        if not self._plot_history or not self._plot_items:
             return
         self._plot_refresh_pending = True
         if time.monotonic_ns() - self._last_plot_refresh_ns >= self._effective_plot_refresh_interval_ns():
             self._refresh_plots()
 
     def _update_capture_rate_label(self) -> None:
-        rate = _recent_rate_hz(self._capture_timestamps_ns)
+        rate = self.controller.capture_rate_hz()
         if rate is None:
             self.capture_rate_label.setText('采集：-- Hz')
             return
@@ -1953,8 +1939,8 @@ def _downsample(x: np.ndarray, y: np.ndarray, max_points: int) -> tuple[np.ndarr
     return sampled_x[order], sampled_y[order]
 
 
-def _latest_window_span(times: list[float], window_seconds: float) -> tuple[float, float] | None:
-    if not times:
+def _latest_window_span(times, window_seconds: float) -> tuple[float, float] | None:
+    if len(times) == 0:
         return None
     first = times[0]
     latest = times[-1]
@@ -1975,8 +1961,8 @@ def _normalize_x_range(view_range) -> tuple[float, float] | None:
     return None
 
 
-def _nearest_index(times: list[float], target: float) -> int | None:
-    if not times:
+def _nearest_index(times, target: float) -> int | None:
+    if len(times) == 0:
         return None
     index = bisect_left(times, target)
     if index <= 0:

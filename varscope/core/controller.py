@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+from collections import deque
+from dataclasses import replace
 import queue
 import threading
 import time
 from pathlib import Path
 
-from varscope.core.decoder import decode_value, decoder_kind_for_type
+from varscope.core.decoder import compile_payload_decoder, decoder_kind_for_type
 from varscope.core.expressions import ExpressionError, parse_expression, resolve_expression
-from varscope.core.memory import extract_raw_values, plan_read_regions
+from varscope.core.memory import plan_read_regions
 from varscope.core.openocd import OpenOcdClient, OpenOcdError, OpenOcdLaunch
 from varscope.core.session_store import SessionStore, create_session_metadata
 from varscope.core.workspace_store import temp_session_path
@@ -19,6 +21,7 @@ RECORDER_BATCH_SIZE = 2048
 RECORDER_FLUSH_INTERVAL_S = 0.25
 RECORDER_IDLE_SLEEP_S = 0.005
 DISPLAY_FRAME_QUEUE_MAX = 4096
+DISPLAY_FRAME_MAX_HZ = 240.0
 
 class RecorderWorker(threading.Thread):
     def __init__(self, store: SessionStore):
@@ -77,6 +80,7 @@ class SamplerWorker(threading.Thread):
         recorder: RecorderWorker | None,
         sample_interval_s: float,
         error_queue: "queue.Queue[str]",
+        display_frame_max_hz: float = DISPLAY_FRAME_MAX_HZ,
     ):
         super().__init__(name="varscope-sampler", daemon=True)
         self.client = client
@@ -87,7 +91,18 @@ class SamplerWorker(threading.Thread):
         self.error_queue = error_queue
         self.stop_event = threading.Event()
         self.regions = plan_read_regions(self.watches)
+        self._frame_regions = tuple(self.regions)
+        self._read_requests = [(region.address, region.size) for region in self.regions]
+        self._payload_decoders = [compile_payload_decoder(watch.type_info) for watch in self.watches]
         self._next_target_check_ns = time.monotonic_ns() + TARGET_CHECK_INTERVAL_NS
+        self._display_frame_min_interval_ns = (
+            max(1, int(1_000_000_000 / display_frame_max_hz))
+            if display_frame_max_hz > 0
+            else 0
+        )
+        self._last_display_enqueue_ns = 0
+        self._metrics_lock = threading.Lock()
+        self._sample_timestamps_ns: deque[int] = deque(maxlen=4096)
         self.dropped_display_frames = 0
 
     def stop(self) -> None:
@@ -102,22 +117,25 @@ class SamplerWorker(threading.Thread):
                     self.client.ensure_target_running()
                     self._next_target_check_ns = now_ns + TARGET_CHECK_INTERVAL_NS
 
-                payloads = []
-                for region in self.regions:
-                    if self.stop_event.is_set():
-                        return
-                    payloads.append(self.client.read_memory(region.address, region.size))
-                raw_values = extract_raw_values(self.regions, payloads, len(self.watches))
+                read_started_ns = time.time_ns()
+                payloads = self.client.read_regions(self._read_requests)
+                read_finished_ns = time.time_ns()
                 if self.stop_event.is_set():
                     return
-                decoded = [
-                    decode_value(raw, watch.type_info)
-                    for raw, watch in zip(raw_values, self.watches, strict=True)
-                ]
+                decoded = self._decode_payloads(payloads)
                 if self.stop_event.is_set():
                     return
-                frame = SampleFrame(timestamp_ns=time.time_ns(), raw_values=raw_values, decoded_values=decoded)
-                self._enqueue_display_frame(frame)
+                timestamp_ns = (read_started_ns + read_finished_ns) // 2
+                self._record_sample_timestamp(timestamp_ns)
+                frame = SampleFrame(
+                    timestamp_ns=timestamp_ns,
+                    raw_values=None,
+                    decoded_values=decoded,
+                    region_payloads=tuple(payloads),
+                    read_regions=self._frame_regions,
+                )
+                if self._should_enqueue_display_frame(timestamp_ns):
+                    self._enqueue_display_frame(frame)
                 if self.recorder is not None:
                     self.recorder.enqueue(frame)
             except Exception as exc:
@@ -128,6 +146,63 @@ class SamplerWorker(threading.Thread):
             sleep_s = max(0.0, self.sample_interval_s) - elapsed
             if sleep_s > 0:
                 time.sleep(sleep_s)
+
+    def sample_rate_hz(self, *, window_s: float = 1.0) -> float | None:
+        if window_s <= 0:
+            return None
+        window_ns = int(window_s * 1_000_000_000)
+        with self._metrics_lock:
+            while len(self._sample_timestamps_ns) >= 2:
+                span_ns = self._sample_timestamps_ns[-1] - self._sample_timestamps_ns[0]
+                if span_ns <= window_ns:
+                    break
+                self._sample_timestamps_ns.popleft()
+
+            if len(self._sample_timestamps_ns) < 2:
+                return None
+
+            span_ns = self._sample_timestamps_ns[-1] - self._sample_timestamps_ns[0]
+            if span_ns <= 0:
+                return None
+            return (len(self._sample_timestamps_ns) - 1) / (span_ns / 1_000_000_000.0)
+
+    def _decode_payloads(self, payloads: list[bytes]) -> list[object]:
+        if len(payloads) != len(self.regions):
+            raise ValueError("Region/payload count mismatch.")
+
+        decoded: list[object | None] = [None] * len(self.watches)
+        for region, payload in zip(self.regions, payloads, strict=True):
+            if len(payload) != region.size:
+                raise ValueError(
+                    f"Payload size {len(payload)} does not match region size {region.size} at 0x{region.address:X}."
+                )
+            payload_view = memoryview(payload)
+            for entry in region.slices:
+                if len(payload_view) < entry.offset + entry.size:
+                    raise ValueError(
+                        f"Slice overflow for watch {entry.watch_index} in region 0x{region.address:X}."
+                    )
+                decoded[entry.watch_index] = self._payload_decoders[entry.watch_index](payload_view, entry.offset)
+
+        missing = [index for index, value in enumerate(decoded) if value is None]
+        if missing:
+            raise ValueError(f"Missing decoded values for watch indexes: {missing}")
+        return [value for value in decoded if value is not None]
+
+    def _record_sample_timestamp(self, timestamp_ns: int) -> None:
+        with self._metrics_lock:
+            self._sample_timestamps_ns.append(timestamp_ns)
+
+    def _should_enqueue_display_frame(self, timestamp_ns: int) -> bool:
+        if self._display_frame_min_interval_ns <= 0:
+            return True
+        if self._last_display_enqueue_ns == 0:
+            self._last_display_enqueue_ns = timestamp_ns
+            return True
+        if timestamp_ns - self._last_display_enqueue_ns >= self._display_frame_min_interval_ns:
+            self._last_display_enqueue_ns = timestamp_ns
+            return True
+        return False
 
 
     def _enqueue_display_frame(self, frame: SampleFrame) -> None:
@@ -161,6 +236,7 @@ class SessionController:
         self.sampler: SamplerWorker | None = None
         self.session_store: SessionStore | None = None
         self.current_session_path: Path | None = None
+        self.current_session_watches: list[ResolvedWatch] = []
         self.current_cfg_path: Path | None = None
 
     def load_elf(self, elf_path: Path) -> tuple[Path, str, list[WatchDefinition]]:
@@ -250,7 +326,8 @@ class SessionController:
             cfg_path=self.current_cfg_path,
             started_ns=started_ns,
         )
-        capture_watches = list(self.resolved_watches)
+        capture_watches = _snapshot_watches(self.resolved_watches)
+        self.current_session_watches = capture_watches
         self.session_store = SessionStore.create(path, metadata, capture_watches)
         self.current_session_path = path
 
@@ -273,8 +350,8 @@ class SessionController:
             self.sampler.join(timeout=1.5)
             self.sampler = None
         if self.recorder is not None:
-            self.recorder.stop(drain=False)
-            self.recorder.join(timeout=2.0)
+            self.recorder.stop(drain=True)
+            self.recorder.join(timeout=5.0)
             if self.recorder.error is not None:
                 self.error_queue.put(str(self.recorder.error))
             self.recorder = None
@@ -310,13 +387,19 @@ class SessionController:
         except queue.Empty:
             return None
 
+    def capture_rate_hz(self) -> float | None:
+        if self.sampler is None:
+            return None
+        return self.sampler.sample_rate_hz()
+
     def export_csv(self, destination: Path) -> None:
         if self.current_session_path is None:
             raise ValueError("No session is available to export.")
         store = self.session_store or SessionStore.open_existing(self.current_session_path)
         should_close = store is not self.session_store
         try:
-            store.export_csv(destination, self.resolved_watches)
+            export_watches = self.current_session_watches or self.resolved_watches
+            store.export_csv(destination, export_watches)
         finally:
             if should_close:
                 store.close()
@@ -385,3 +468,16 @@ class SessionController:
             description=f"0x{result.address:08X} / {type_info.unwrap().describe()}",
             type_info=type_info,
         )
+
+
+def _snapshot_watches(watches: list[ResolvedWatch]) -> list[ResolvedWatch]:
+    snapshot: list[ResolvedWatch] = []
+    for watch in watches:
+        definition = WatchDefinition(
+            expression=watch.definition.expression,
+            alias=watch.definition.alias,
+            color=watch.definition.color,
+            plot_enabled=watch.definition.plot_enabled,
+        )
+        snapshot.append(replace(watch, definition=definition))
+    return snapshot
